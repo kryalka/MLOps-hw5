@@ -1,0 +1,106 @@
+apiVersion: 1
+groups:
+- orgId: 1
+  name: fraud-service
+  folder: Fraud monitoring
+  interval: 10s
+  rules:
+  - uid: fraud-share
+    title: Высокая доля фрода
+    condition: C
+    for: 30s
+    noDataState: Alerting
+    execErrState: Alerting
+    annotations:
+      summary: Более 20% транзакций получили флаг фрода за последнюю минуту.
+      __dashboardUid__: fraud-scoring
+      __panelId__: '3'
+    labels:
+      service: fraud_detector
+      severity: warning
+    isPaused: false
+    data:
+    - refId: A
+      relativeTimeRange:
+        from: 60
+        to: 0
+      datasourceUid: prometheus
+      model:
+        refId: A
+        expr: sum(rate(fraud_transactions_total[1m])) / clamp_min(sum(rate(transactions_total[1m])),
+          0.000001)
+        instant: true
+        range: false
+        intervalMs: 1000
+        maxDataPoints: 43200
+    - refId: C
+      relativeTimeRange:
+        from: 0
+        to: 0
+      datasourceUid: __expr__
+      model:
+        refId: C
+        type: threshold
+        expression: A
+        conditions:
+        - evaluator:
+            params:
+            - 0.2
+            type: gt
+          operator:
+            type: and
+          reducer:
+            type: last
+            params: []
+          query:
+            params:
+            - C
+  - uid: stream-stopped
+    title: Остановился поток
+    condition: C
+    for: 30s
+    noDataState: Alerting
+    execErrState: Alerting
+    annotations:
+      summary: Более 30 секунд нет успешно обработанных сообщений.
+      __dashboardUid__: fraud-scoring
+      __panelId__: '6'
+    labels:
+      service: fraud_detector
+      severity: warning
+    isPaused: false
+    data:
+    - refId: A
+      relativeTimeRange:
+        from: 60
+        to: 0
+      datasourceUid: prometheus
+      model:
+        refId: A
+        expr: time() - last_transaction_timestamp_seconds
+        instant: true
+        range: false
+        intervalMs: 1000
+        maxDataPoints: 43200
+    - refId: C
+      relativeTimeRange:
+        from: 0
+        to: 0
+      datasourceUid: __expr__
+      model:
+        refId: C
+        type: threshold
+        expression: A
+        conditions:
+        - evaluator:
+            params:
+            - 30
+            type: gt
+          operator:
+            type: and
+          reducer:
+            type: last
+            params: []
+          query:
+            params:
+            - C

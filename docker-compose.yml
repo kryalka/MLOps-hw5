@@ -1,0 +1,283 @@
+name: mlops-hw5
+services:
+  zookeeper:
+    image: confluentinc/cp-zookeeper:7.3.0
+    restart: unless-stopped
+    networks:
+      - ml-scorer
+    environment:
+      ZOOKEEPER_CLIENT_PORT: 2181
+      ZOOKEEPER_TICK_TIME: 2000
+    volumes:
+      - zookeeper_data:/var/lib/zookeeper/data
+      - zookeeper_log:/var/lib/zookeeper/log
+  kafka:
+    image: confluentinc/cp-kafka:7.3.0
+    restart: unless-stopped
+    depends_on:
+      - zookeeper
+    networks:
+      - ml-scorer
+    environment:
+      KAFKA_BROKER_ID: 1
+      KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
+      KAFKA_LISTENERS: PLAINTEXT://0.0.0.0:9092
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: 'false'
+      KAFKA_HEAP_OPTS: -Xms256m -Xmx512m
+    volumes:
+      - kafka_data:/var/lib/kafka/data
+    healthcheck:
+      test:
+        - CMD
+        - kafka-topics
+        - --bootstrap-server
+        - localhost:9092
+        - --list
+      interval: 10s
+      timeout: 10s
+      retries: 30
+      start_period: 20s
+  kafka-setup:
+    image: confluentinc/cp-kafka:7.3.0
+    networks:
+      - ml-scorer
+    depends_on:
+      kafka:
+        condition: service_healthy
+    entrypoint:
+      - /bin/bash
+      - -ec
+    command:
+      - |
+        for topic in transactions scoring; do
+          kafka-topics --bootstrap-server kafka:9092 --create --if-not-exists \
+            --topic "$$topic" --partitions 3 --replication-factor 1 --config retention.ms=604800000
+        done
+  kafka-ui:
+    image: provectuslabs/kafka-ui:v0.7.2
+    restart: unless-stopped
+    networks:
+      - ml-scorer
+    ports:
+      - 127.0.0.1:8084:8080
+    environment:
+      KAFKA_CLUSTERS_0_NAME: local
+      KAFKA_CLUSTERS_0_BOOTSTRAPSERVERS: kafka:9092
+    depends_on:
+      kafka-setup:
+        condition: service_completed_successfully
+  fraud_detector:
+    build: ./fraud_detector
+    networks:
+      - ml-scorer
+    environment:
+      KAFKA_BOOTSTRAP_SERVERS: kafka:9092
+      KAFKA_TRANSACTIONS_TOPIC: transactions
+      KAFKA_SCORING_TOPIC: scoring
+      MODELS_DIR: /models
+      FRAUD_THRESHOLD: ${FRAUD_THRESHOLD:-0.5}
+    volumes:
+      - model_registry:/models
+    ports:
+      - 127.0.0.1:8000:8000
+    depends_on:
+      kafka:
+        condition: service_healthy
+      kafka-setup:
+        condition: service_completed_successfully
+    restart: unless-stopped
+  postgres:
+    image: postgres:15
+    networks:
+      - ml-scorer
+    environment:
+      POSTGRES_USER: fraud_user
+      POSTGRES_PASSWORD: fraud_password
+      POSTGRES_DB: fraud_db
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./postgres/init.sql:/docker-entrypoint-initdb.d/init.sql:ro
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - pg_isready -U $$POSTGRES_USER -d $$POSTGRES_DB
+      interval: 5s
+      timeout: 10s
+      retries: 5
+    restart: unless-stopped
+  transaction_simulator:
+    build: ./transaction_simulator
+    networks:
+      - ml-scorer
+    environment:
+      KAFKA_BROKERS: kafka:9092
+      KAFKA_TOPIC: transactions
+      TRANSACTIONS_CSV_PATH: /data/train.csv
+      SEND_INTERVAL_SECONDS: ${SEND_INTERVAL_SECONDS:-0.1}
+    volumes:
+      - ./data/train.csv:/data/train.csv:ro
+    depends_on:
+      kafka:
+        condition: service_healthy
+      kafka-setup:
+        condition: service_completed_successfully
+    restart: unless-stopped
+  scoring_writer:
+    build: ./scoring_writer
+    networks:
+      - ml-scorer
+    environment:
+      KAFKA_BOOTSTRAP_SERVERS: kafka:9092
+      KAFKA_SCORING_TOPIC: scoring
+      POSTGRES_HOST: postgres
+      POSTGRES_PORT: '5432'
+      POSTGRES_DB: fraud_db
+      POSTGRES_USER: fraud_user
+      POSTGRES_PASSWORD: fraud_password
+    ports:
+      - 127.0.0.1:8001:8001
+    depends_on:
+      postgres:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+      kafka-setup:
+        condition: service_completed_successfully
+    restart: unless-stopped
+  data_loader:
+    build: ./data_loader
+    networks:
+      - ml-scorer
+    environment:
+      POSTGRES_HOST: postgres
+      POSTGRES_PORT: '5432'
+      POSTGRES_DB: fraud_db
+      POSTGRES_USER: fraud_user
+      POSTGRES_PASSWORD: fraud_password
+      LABELED_CSV_PATH: /data/train.csv
+      TRAINING_DATA_DIR: /training_data
+    volumes:
+      - ./data/train.csv:/data/train.csv:ro
+      - training_data:/training_data
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: 'no'
+  airflow:
+    build: ./airflow
+    user: 0:0
+    networks:
+      - ml-scorer
+    environment:
+      AIRFLOW__CORE__EXECUTOR: SequentialExecutor
+      AIRFLOW__CORE__LOAD_EXAMPLES: 'false'
+      AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION: 'false'
+      AIRFLOW__CORE__DAGS_FOLDER: /opt/airflow/dags
+      AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: sqlite:////opt/airflow/airflow_state/airflow.db
+      AIRFLOW__SCHEDULER__DAG_DIR_LIST_INTERVAL: '30'
+      PYTHONPATH: /opt/airflow
+      _AIRFLOW_WWW_USER_USERNAME: admin
+      _AIRFLOW_WWW_USER_PASSWORD: admin
+      POSTGRES_HOST: postgres
+      POSTGRES_PORT: '5432'
+      POSTGRES_DB: fraud_db
+      POSTGRES_USER: fraud_user
+      POSTGRES_PASSWORD: fraud_password
+      TRAINING_DATA_DIR: /opt/airflow/training_data
+      MODELS_DIR: /opt/airflow/models
+      FRAUD_SRC: /opt/airflow/fraud_src
+      AIRFLOW__WEBSERVER__SECRET_KEY: hw5-local-secret
+      AIRFLOW__WEBSERVER__WORKERS: '1'
+    volumes:
+      - ./dags:/opt/airflow/dags
+      - ./pipeline:/opt/airflow/pipeline:ro
+      - ./fraud_detector/src:/opt/airflow/fraud_src:ro
+      - training_data:/opt/airflow/training_data
+      - model_registry:/opt/airflow/models
+      - airflow_state:/opt/airflow/airflow_state
+      - airflow_logs:/opt/airflow/logs
+    ports:
+      - 127.0.0.1:8083:8080
+    depends_on:
+      postgres:
+        condition: service_healthy
+      data_loader:
+        condition: service_completed_successfully
+    restart: unless-stopped
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - curl --fail --silent http://localhost:8080/health | python -c 'import json,sys; h=json.load(sys.stdin);
+          sys.exit(h["scheduler"]["status"] != "healthy")'
+      interval: 15s
+      timeout: 10s
+      retries: 40
+      start_period: 90s
+  prometheus:
+    image: prom/prometheus:v3.2.1
+    ports:
+      - 127.0.0.1:9090:9090
+    volumes:
+      - ./prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus_data:/prometheus
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.path=/prometheus
+      - --storage.tsdb.retention.time=3d
+    networks:
+      - ml-scorer
+    restart: unless-stopped
+  grafana:
+    image: grafana/grafana:11.6.0
+    ports:
+      - 127.0.0.1:3000:3000
+    volumes:
+      - grafana_data:/var/lib/grafana
+      - ./grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./grafana/dashboards:/var/lib/grafana/dashboards:ro
+    environment:
+      - GF_SECURITY_ADMIN_PASSWORD=admin
+      - GF_USERS_ALLOW_SIGN_UP=false
+      - GF_DASHBOARDS_MIN_REFRESH_INTERVAL=1s
+      - GF_SECURITY_ADMIN_USER=admin
+      - GF_DATE_FORMATS_DEFAULT_TIMEZONE=browser
+      - GF_ANALYTICS_REPORTING_ENABLED=false
+      - GF_NEWS_NEWS_FEED_ENABLED=false
+    depends_on:
+      prometheus:
+        condition: service_started
+      scoring_writer:
+        condition: service_started
+    networks:
+      - ml-scorer
+    restart: unless-stopped
+  node-exporter:
+    image: prom/node-exporter:v1.9.0
+    volumes:
+      - /:/host:ro
+    command:
+      - --path.rootfs=/host
+      - --collector.filesystem.mount-points-exclude=^/(dev|proc|sys|var/lib/docker/.+|host|etc)($$|/)
+    expose:
+      - 9100
+    networks:
+      - ml-scorer
+    restart: unless-stopped
+networks:
+  ml-scorer:
+    driver: bridge
+volumes:
+  postgres_data:
+  training_data:
+  model_registry:
+  airflow_state:
+  prometheus_data:
+  grafana_data:
+  kafka_data:
+  zookeeper_data:
+  zookeeper_log:
+  airflow_logs:
